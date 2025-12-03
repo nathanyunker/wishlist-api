@@ -1,91 +1,136 @@
-import { DynamoDBClient, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, DeleteCommand, PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { v4 as uuidv4 } from "uuid";
 
 const client = new DynamoDBClient({ region: "us-east-1" });
+const ddbDocClient = DynamoDBDocumentClient.from(client);
 
-// Utility function to convert DynamoDB item to plain JSON
-const unmarshallItem = (item) => {
-  const result = {};
-  for (const [key, value] of Object.entries(item)) {
-    if (value.S) result[key] = value.S; // Handle string values
-    if (value.L) result[key] = value.L.map((v) => v.S); // Handle list of strings
+// Utility to create standard responses
+const createResponse = (statusCode, body) => ({
+  statusCode,
+  headers: {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  },
+  body: JSON.stringify(body),
+});
+
+// POST /wishlist/item handler
+const addWishlistItem = async (event) => {
+  const requestBody = JSON.parse(event.body);
+  const { item, link, price, notes, name } = requestBody;
+
+  if (!item || !link || price === undefined || !name) {
+    return createResponse(400, { message: "Missing required fields" });
   }
-  return result;
+
+  const guid = uuidv4();
+  const id = `wishlist-item#${guid}`;
+  const dynamoItem = {
+    id,
+    name,
+    gsipk: "wishlist-item",
+    gsisk: `wishlist-item#${name}`,
+    item,
+    link,
+    price,
+    notes,
+  };
+
+  await ddbDocClient.send(
+    new PutCommand({ TableName: "SiblingsGiftExchange", Item: dynamoItem })
+  );
+
+  return createResponse(201, { message: "Item added successfully", itemId: id });
 };
 
+// DELETE /wishlist/item/{id} handler
+const deleteWishlistItem = async (event) => {
+  const id = `wishlist-item#${event.pathParameters?.id}`;
+  if (!id) {
+    return createResponse(400, { message: "Missing required parameter: id" });
+  }
+
+  await ddbDocClient.send(
+    new DeleteCommand({
+      TableName: "SiblingsGiftExchange",
+      Key: { id },
+    })
+  );
+
+  return createResponse(200, { message: "Item deleted successfully" });
+};
+
+// GET /wishlist/{name} handler
+const getWishlistItems = async (event) => {
+  const name = event.pathParameters?.name;
+  if (!name) {
+    return createResponse(400, { message: "Missing required parameter: name" });
+  }
+
+  const queryResult = await ddbDocClient.send(
+    new QueryCommand({
+      TableName: "SiblingsGiftExchange",
+      IndexName: "gsipk-gsisk-index",
+      KeyConditionExpression: "gsipk = :gsipk AND gsisk = :gsisk",
+      ExpressionAttributeValues: {
+        ":gsipk": "wishlist-item",
+        ":gsisk": `wishlist-item#${name}`,
+      },
+    })
+  );
+
+  return createResponse(200, {
+    id: queryResult.id,
+    items: queryResult.Items || [],
+  });
+};
+
+// GET /wishlist/exchange/{id} handler
+const getExchangeById = async (event) => {
+  const id = event.pathParameters?.id;
+  if (!id) {
+    return createResponse(400, { message: "Missing required parameter: id" });
+  }
+
+  const queryResult = await ddbDocClient.send(
+    new QueryCommand({
+      TableName: "SiblingsGiftExchange",
+      KeyConditionExpression: "id = :id",
+      ExpressionAttributeValues: {
+        ":id": `exchange#${id}`,
+      },
+    })
+  );
+
+  if (!queryResult.Items || queryResult.Items.length === 0) {
+    return createResponse(404, { message: "Exchange not found" });
+  }
+
+  // Assuming only one item should match the pk, return the first one
+  return createResponse(200, queryResult.Items[0]);
+};
+
+// Main Lambda handler with route dispatching
 export const handler = async (event) => {
   try {
-    const body = JSON.parse(event.body);
-    const { googleId, email, name, picture, exchanges } = body;
+    const routeKey = event.routeKey;
 
-    // Validate required fields
-    if (!googleId || !email || !name) {
-      return {
-        statusCode: 400,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "Missing required fields: googleId, email, or name" }),
-      };
-    }
-
-    // Validate exchanges if provided
-    let exchangesList = null;
-    if (exchanges !== undefined) {
-      if (!Array.isArray(exchanges)) {
-        return {
-          statusCode: 400,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ error: "Exchanges must be an array" }),
-        };
-      }
-      exchangesList = exchanges.map((item) => ({ S: item })); // Convert to DynamoDB list of strings
-    }
-
-    // Get current ISO date/time
-    const currentTime = new Date().toISOString();
-
-    const params = {
-      TableName: "MinervaUsers",
-      Key: {
-        pk: { S: email },                    // Partition key: email
-        sk: { S: `google-user#${googleId}` }, // Sort key: "google-user#" + googleId
-      },
-      UpdateExpression: `
-        SET #name = if_not_exists(#name, :name),
-            #lastLogin = :lastLogin
-        ${picture ? ", #picture = if_not_exists(#picture, :picture)" : ""}
-        ${exchangesList ? ", #exchanges = :exchanges" : ""}
-      `,
-      ExpressionAttributeNames: {
-        "#name": "name",
-        "#lastLogin": "lastLogin",
-        ...(picture && { "#picture": "picture" }),
-        ...(exchangesList && { "#exchanges": "exchanges" }),
-      },
-      ExpressionAttributeValues: {
-        ":name": { S: name },
-        ":lastLogin": { S: currentTime },
-        ...(picture && { ":picture": { S: picture } }),
-        ...(exchangesList && { ":exchanges": { L: exchangesList } }),
-      },
-      ReturnValues: "ALL_NEW"
+    const routes = {
+      "POST /wishlist/item": addWishlistItem,
+      "GET /wishlist/{name}": getWishlistItems,
+      "DELETE /wishlist/item/{id}": deleteWishlistItem,
+      "GET /wishlist/exchange/{id}": getExchangeById,
     };
 
-    const command = new UpdateItemCommand(params);
-    const result = await client.send(command);
+    const routeHandler = routes[routeKey];
+    if (!routeHandler) {
+      return createResponse(404, { message: "Route not found" });
+    }
 
-    // Convert the DynamoDB item to a plain JSON object
-    const updatedItem = unmarshallItem(result.Attributes);
-
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updatedItem),
-    };
+    return await routeHandler(event);
   } catch (error) {
     console.error("Error processing request:", error);
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ error: "Internal server error" }),
-    };
+    return createResponse(500, { message: "Internal server error", error: error.message });
   }
 };
